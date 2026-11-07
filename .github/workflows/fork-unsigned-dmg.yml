@@ -1,0 +1,85 @@
+name: Fork unsigned arm64 DMG
+
+on:
+  push:
+    branches:
+      - "ci/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ad-hoc signed arm64 DMG
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DERIVED_DATA: ${{ github.workspace }}/build/DerivedData
+      DIST_PATH: ${{ github.workspace }}/build/dist
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Build Release (arm64, ad-hoc)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project YohakuCompanion.xcodeproj \
+            -scheme YohakuCompanion \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER=
+
+      - name: Thin to arm64 and re-sign ad-hoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$DERIVED_DATA/Build/Products/Release/YohakuCompanion.app"
+          test -d "$APP_PATH"
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q '^Mach-O universal'; then
+              lipo "$f" -thin arm64 -output "$f.thin" && mv -f "$f.thin" "$f"
+              echo "Thinned: $f"
+            fi
+          done < <(find "$APP_PATH" -type f -perm -u+x -print0)
+          codesign --force --deep --sign - --preserve-metadata=identifier,entitlements "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          lipo -archs "$APP_PATH/Contents/MacOS/YohakuCompanion"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Create DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          DMG_ROOT="$RUNNER_TEMP/dmg-root"
+          mkdir -p "$DMG_ROOT" "$DIST_PATH"
+          ditto "$APP_PATH" "$DMG_ROOT/YohakuCompanion.app"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          DMG_PATH="$DIST_PATH/YohakuCompanion-v${VERSION}-${SHORT_SHA}-arm64-unsigned.dmg"
+          hdiutil create -fs HFS+ -format UDZO -volname "Yohaku Companion" \
+            -srcfolder "$DMG_ROOT" "$DMG_PATH"
+          hdiutil verify "$DMG_PATH"
+          echo "DMG_NAME=$(basename "$DMG_PATH" .dmg)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.DMG_NAME }}
+          path: ${{ env.DIST_PATH }}/*.dmg
+          retention-days: 14
